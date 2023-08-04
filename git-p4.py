@@ -34,7 +34,7 @@
 import struct
 import sys
 if sys.version_info.major < 3 and sys.version_info.minor < 7:
-    sys.stderr.write("git-p4: requires Python 2.7 or later.\n")
+    sys.stderr.write("git-p4: requires Python 3.7 or later.\n")
     sys.exit(1)
 
 import ctypes
@@ -79,6 +79,10 @@ p4_access_checked = False
 
 re_ko_keywords = re.compile(br'\$(Id|Header)(:[^$\n]+)?\$')
 re_k_keywords = re.compile(br'\$(Id|Header|Author|Date|DateTime|Change|File|Revision)(:[^$\n]+)?\$')
+
+# Remember the current working directory in case --destination is used.
+# --destination handler uses chdir(), which can cause p4 commands to fail.
+p4_cwd = os.getcwd()
 
 
 def format_size_human_readable(num):
@@ -880,8 +884,20 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
         stdin_file.flush()
         stdin_file.seek(0)
 
+    # If --destination was used, that causes this script to chdir() to the git
+    # dir. This can cause Perforce commands to fail, for example if env var
+    # P4CONFIG=.p4config and that .p4config folder is in the Perforce
+    # directory. Avoid that by temporarily chdir'ing back to the Perforce dir.
+    cwd = os.environ['PWD']
+    chdir_needed = cwd != p4_cwd
+    if chdir_needed:
+        chdir(p4_cwd)
+
     p4 = subprocess.Popen(
         cmd, stdin=stdin_file, stdout=subprocess.PIPE, *k, **kw)
+
+    if chdir_needed:
+        chdir(cwd)
 
     result = []
     try:
@@ -2853,7 +2869,8 @@ class View(object):
                 # assume error is "... file(s) not in client view"
                 continue
             if "clientFile" not in res:
-                die("No clientFile in 'p4 where' output")
+                die("No clientFile in 'p4 where' output. Full output: %s" %
+                    where_result)
             if "unmap" in res:
                 # it will list all of them, but only one not unmap-ped
                 continue
