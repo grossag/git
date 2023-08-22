@@ -315,7 +315,7 @@ def decode_path(path):
         except:
             path = path.decode(encoding, errors='replace')
             if verbose:
-                print('Path with non-ASCII characters detected. Used {} to decode: {}'.format(encoding, path))
+                print(u'Path with non-ASCII characters detected. Used {} to decode: {}'.format(encoding, path))
         return path
 
 
@@ -899,6 +899,8 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
     if chdir_needed:
         chdir(cwd)
 
+    path_encoding = gitConfig('git-p4.pathEncoding') or 'utf-8'
+
     result = []
     try:
         while True:
@@ -914,7 +916,17 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
                     decoded_entry[key] = value
                 # Parse out data if it's an error response
                 if decoded_entry.get('code') == 'error' and 'data' in decoded_entry:
-                    decoded_entry['data'] = decoded_entry['data'].decode()
+                    data = decoded_entry['data']
+                    try:
+                        decoded_entry['data'] = data.decode(path_encoding)
+                    except UnicodeDecodeError as e:
+                        print('Perforce command "%s" resulted in data that '
+                              'failed to decode' % cmd)
+                        print('stdin provided to command: %s' % stdin)
+                        print('Failed to decode response: %s' % data)
+                        print('Full entry info: %s' % decoded_entry)
+                        print('skip_info=%s' % skip_info)
+                        raise e
                 entry = decoded_entry
             if skip_info:
                 if 'code' in entry and entry['code'] == 'info':
@@ -3405,7 +3417,7 @@ class P4Sync(Command, P4UserMap):
             return True
         inClientSpec = self.clientSpecDirs.map_in_client(path)
         if not inClientSpec and self.verbose:
-            print('Ignoring file outside of client spec: {0}'.format(path))
+            print(u'Ignoring file outside of client spec: {0}'.format(path))
         return inClientSpec
 
     def hasBranchPrefix(self, path):
@@ -3414,7 +3426,7 @@ class P4Sync(Command, P4UserMap):
         hasPrefix = [p for p in self.branchPrefixes
                         if p4PathStartsWith(path, p)]
         if not hasPrefix and self.verbose:
-            print('Ignoring file outside of prefix: {0}'.format(path))
+            print(u'Ignoring file outside of prefix: {0}'.format(path))
         return hasPrefix
 
     def findShadowedFiles(self, files, change):
@@ -3916,7 +3928,7 @@ class P4Sync(Command, P4UserMap):
         newestRevision = 0
 
         fileCnt = 0
-        fileArgs = ["%s...%s" % (p, revision) for p in self.depotPaths]
+        fileArgs = ["...%s" % revision]
 
         for info in p4CmdList(["files"] + fileArgs):
 
