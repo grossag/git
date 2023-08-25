@@ -888,7 +888,7 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
     # dir. This can cause Perforce commands to fail, for example if env var
     # P4CONFIG=.p4config and that .p4config folder is in the Perforce
     # directory. Avoid that by temporarily chdir'ing back to the Perforce dir.
-    cwd = os.environ['PWD']
+    cwd = os.environ.get('PWD', os.getcwd())
     chdir_needed = cwd != p4_cwd
     if chdir_needed:
         chdir(p4_cwd)
@@ -2944,6 +2944,8 @@ class P4Sync(Command, P4UserMap):
                                      help="Keep entire BRANCH/DIR/SUBDIR prefix during import"),
                 optparse.make_option("--use-client-spec", dest="useClientSpec", action='store_true',
                                      help="Only sync files that are included in the Perforce Client Spec"),
+                optparse.make_option("--perforce-client-dir", dest="perforceClientDir",
+                                     help="Perforce working directory"),
                 optparse.make_option("-/", dest="cloneExclude",
                                      action="callback", callback=cloneExcludeCallback, type="string",
                                      help="exclude depot path"),
@@ -2975,6 +2977,7 @@ class P4Sync(Command, P4UserMap):
         self.cloneExclude = []
         self.useClientSpec = False
         self.useClientSpec_from_options = False
+        self.perforceClientDir = ""
         self.clientSpecDirs = None
         self.tempBranches = []
         self.tempBranchLocation = "refs/git-p4-tmp"
@@ -4089,6 +4092,9 @@ class P4Sync(Command, P4UserMap):
             if gitConfigBool("git-p4.useclientspec"):
                 self.useClientSpec = True
         if self.useClientSpec:
+            if self.perforceClientDir:
+                global p4_cwd
+                p4_cwd = self.perforceClientDir
             self.clientSpecDirs = getClientSpec()
 
         # TODO: should always look at previous commits,
