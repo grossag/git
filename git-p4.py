@@ -584,19 +584,29 @@ def p4_last_change():
     return int(results[0]['change'])
 
 
+
 def p4_describe(change, shelved=False):
     """Make sure it returns a valid result by checking for the presence of
        field "time".
 
        Return a dict of the results.
        """
+    p4 = p4_describe_launch(change, shelved=shelved)
+    return p4_describe_result(p4, change)
 
+
+def p4_describe_launch(change, shelved=False):
     cmd = ["describe", "-s"]
     if shelved:
         cmd += ["-S"]
     cmd += [str(change)]
 
-    ds = p4CmdList(cmd, skip_info=True)
+    return p4CmdList_launch(cmd)
+
+
+def p4_describe_result(p4, change):
+    ds = p4CmdList_result(p4, skip_info=True)
+
     if len(ds) != 1:
         die("p4 describe -s %d did not return 1 result: %s" % (change, str(ds)))
 
@@ -863,8 +873,12 @@ def p4KeyWhichCanBeDirectlyDecoded(key):
 
 
 def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
-        errors_as_exceptions=False, *k, **kw):
+              errors_as_exceptions=False, *k, **kw):
+    p4 = p4CmdList_launch(cmd, stdin=stdin, stdin_mode=stdin_mode, *k, **kw)
+    return p4CmdList_result(p4, cb=cb, errors_as_exceptions=errors_as_exceptions)
 
+
+def p4CmdList_launch(cmd, stdin=None, stdin_mode='w+b', *k, **kw):
     cmd = p4_build_cmd(["-G"] + cmd)
     if verbose:
         sys.stderr.write("Opening pipe: {}\n".format(' '.join(cmd)))
@@ -899,6 +913,10 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
     if chdir_needed:
         chdir(cwd)
 
+    return p4
+
+
+def p4CmdList_result(p4, cb=None, skip_info=False, errors_as_exceptions=None):
     path_encoding = gitConfig('git-p4.pathEncoding') or 'utf-8'
 
     result = []
@@ -916,17 +934,7 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
                     decoded_entry[key] = value
                 # Parse out data if it's an error response
                 if decoded_entry.get('code') == 'error' and 'data' in decoded_entry:
-                    data = decoded_entry['data']
-                    try:
-                        decoded_entry['data'] = data.decode(path_encoding)
-                    except UnicodeDecodeError as e:
-                        print('Perforce command "%s" resulted in data that '
-                              'failed to decode' % cmd)
-                        print('stdin provided to command: %s' % stdin)
-                        print('Failed to decode response: %s' % data)
-                        print('Full entry info: %s' % decoded_entry)
-                        print('skip_info=%s' % skip_info)
-                        raise e
+                    decoded_entry['data'] = decoded_entry['data'].decode(path_encoding)
                 entry = decoded_entry
             if skip_info:
                 if 'code' in entry and entry['code'] == 'info':
@@ -2869,27 +2877,36 @@ class View(object):
     def update_client_spec_path_cache(self, files):
         """Caching file paths by "p4 where" batch query."""
 
+        def cache_key(p, ignoreCase):
+            return decode_path(p).lower() if ignoreCase else decode_path(p)
+
         # List depot file paths exclude that already cached
-        fileArgs = [f['path'] for f in files if decode_path(f['path']) not in self.client_spec_path_cache]
+        ignoreCase = gitConfigBool("core.ignorecase")
+
+        fileArgs = [f['path'] for f in files if
+                    cache_key(f['path'], ignoreCase) not in self.client_spec_path_cache]
 
         if len(fileArgs) == 0:
             return  # All files in cache
 
+        print('Asking `p4 where` about: %s' % fileArgs)
+
         where_result = p4CmdList(["-x", "-", "where"], stdin=fileArgs)
-        for res in where_result:
+        for res, f in zip(where_result, fileArgs):
+            ck = cache_key(f, ignoreCase)
+
             if "code" in res and res["code"] == "error":
                 # assume error is "... file(s) not in client view"
+                self.client_spec_path_cache[ck] = b''
                 continue
             if "clientFile" not in res:
                 die("No clientFile in 'p4 where' output. Full output: %s" %
                     where_result)
             if "unmap" in res:
                 # it will list all of them, but only one not unmap-ped
+                self.client_spec_path_cache[ck] = b''
                 continue
-            depot_path = decode_path(res['depotFile'])
-            if gitConfigBool("core.ignorecase"):
-                depot_path = depot_path.lower()
-            self.client_spec_path_cache[depot_path] = self.convert_client_path(res["clientFile"])
+            self.client_spec_path_cache[ck] = self.convert_client_path(res["clientFile"])
 
         # not found files or unmap files set to ""
         for depotFile in fileArgs:
@@ -3506,7 +3523,7 @@ class P4Sync(Command, P4UserMap):
         self.gitStream.write(self.make_email(author))
         self.gitStream.write(" %s %s\n" % (epoch, self.tz))
 
-        self.gitStream.write("data <<EOT\n")
+        self.gitStream.write("data <<EOTABCXYZ\n")
         self.gitStream.write(details["desc"])
         if len(jobs) > 0:
             self.gitStream.write("\nJobs: %s" % (' '.join(jobs)))
@@ -3518,7 +3535,7 @@ class P4Sync(Command, P4UserMap):
                 self.gitStream.write(": options = %s" % details['options'])
             self.gitStream.write("]\n")
 
-        self.gitStream.write("EOT\n\n")
+        self.gitStream.write("EOTABCXYZ\n\n")
 
         if len(parent) > 0:
             if self.verbose:
@@ -3829,88 +3846,102 @@ class P4Sync(Command, P4UserMap):
                 return commit
         return None
 
+    def split_list(self, input_list, sublist_size):
+        return [input_list[i:i + sublist_size] for i in range(0, len(input_list), sublist_size)]
+
     def importChanges(self, changes, origin_revision=0):
         cnt = 1
-        for change in changes:
-            description = p4_describe(change)
-            self.updateOptionDict(description)
 
-            if not self.silent:
-                sys.stdout.write("\rImporting revision %s (%d%%)" % (
-                    change, (cnt * 100) // len(changes)))
-                sys.stdout.flush()
-            cnt = cnt + 1
+        change_batches = self.split_list(changes, 50)
+        for change_batch in change_batches:
+            all_p4_describes = []
 
-            try:
-                if self.detectBranches:
-                    branches = self.splitFilesIntoBranches(description)
-                    for branch in branches.keys():
-                        # HACK  --hwn
-                        branchPrefix = self.depotPaths[0] + branch + "/"
-                        self.branchPrefixes = [branchPrefix]
+            for change in change_batch:
+                all_p4_describes.append(p4_describe_launch(change))
 
-                        parent = ""
+            all_descriptions = []
+            for p4_describe, change in zip(all_p4_describes, change_batch):
+                all_descriptions.append(p4_describe_result(p4_describe, change))
 
-                        filesForCommit = branches[branch]
+            for change, description in zip(change_batch, all_descriptions):
+                self.updateOptionDict(description)
 
-                        if self.verbose:
-                            print("branch is %s" % branch)
+                if not self.silent:
+                    sys.stdout.write("\rImporting revision %s (%d%%)" % (
+                        change, (cnt * 100) // len(changes)))
+                    sys.stdout.flush()
+                cnt = cnt + 1
 
-                        self.updatedBranches.add(branch)
+                try:
+                    if self.detectBranches:
+                        branches = self.splitFilesIntoBranches(description)
+                        for branch in branches.keys():
+                            # HACK  --hwn
+                            branchPrefix = self.depotPaths[0] + branch + "/"
+                            self.branchPrefixes = [branchPrefix]
 
-                        if branch not in self.createdBranches:
-                            self.createdBranches.add(branch)
-                            parent = self.knownBranches[branch]
-                            if parent == branch:
-                                parent = ""
-                            else:
-                                fullBranch = self.projectName + branch
-                                if fullBranch not in self.p4BranchesInGit:
-                                    if not self.silent:
-                                        print("\n    Importing new branch %s" % fullBranch)
-                                    if self.importNewBranch(branch, change - 1):
-                                        parent = ""
-                                        self.p4BranchesInGit.append(fullBranch)
-                                    if not self.silent:
-                                        print("\n    Resuming with change %s" % change)
+                            parent = ""
 
+                            filesForCommit = branches[branch]
+
+                            if self.verbose:
+                                print("branch is %s" % branch)
+
+                            self.updatedBranches.add(branch)
+
+                            if branch not in self.createdBranches:
+                                self.createdBranches.add(branch)
+                                parent = self.knownBranches[branch]
+                                if parent == branch:
+                                    parent = ""
+                                else:
+                                    fullBranch = self.projectName + branch
+                                    if fullBranch not in self.p4BranchesInGit:
+                                        if not self.silent:
+                                            print("\n    Importing new branch %s" % fullBranch)
+                                        if self.importNewBranch(branch, change - 1):
+                                            parent = ""
+                                            self.p4BranchesInGit.append(fullBranch)
+                                        if not self.silent:
+                                            print("\n    Resuming with change %s" % change)
+
+                                    if self.verbose:
+                                        print("parent determined through known branches: %s" % parent)
+
+                            branch = self.gitRefForBranch(branch)
+                            parent = self.gitRefForBranch(parent)
+
+                            if self.verbose:
+                                print("looking for initial parent for %s; current parent is %s" % (branch, parent))
+
+                            if len(parent) == 0 and branch in self.initialParents:
+                                parent = self.initialParents[branch]
+                                del self.initialParents[branch]
+
+                            blob = None
+                            if len(parent) > 0:
+                                tempBranch = "%s/%d" % (self.tempBranchLocation, change)
                                 if self.verbose:
-                                    print("parent determined through known branches: %s" % parent)
-
-                        branch = self.gitRefForBranch(branch)
-                        parent = self.gitRefForBranch(parent)
-
-                        if self.verbose:
-                            print("looking for initial parent for %s; current parent is %s" % (branch, parent))
-
-                        if len(parent) == 0 and branch in self.initialParents:
-                            parent = self.initialParents[branch]
-                            del self.initialParents[branch]
-
-                        blob = None
-                        if len(parent) > 0:
-                            tempBranch = "%s/%d" % (self.tempBranchLocation, change)
-                            if self.verbose:
-                                print("Creating temporary branch: " + tempBranch)
-                            self.commit(description, filesForCommit, tempBranch)
-                            self.tempBranches.append(tempBranch)
-                            self.checkpoint()
-                            blob = self.searchParent(parent, branch, tempBranch)
-                        if blob:
-                            self.commit(description, filesForCommit, branch, blob)
-                        else:
-                            if self.verbose:
-                                print("Parent of %s not found. Committing into head of %s" % (branch, parent))
-                            self.commit(description, filesForCommit, branch, parent)
-                else:
-                    files = self.extractFilesFromCommit(description)
-                    self.commit(description, files, self.branch,
-                                self.initialParent)
-                    # only needed once, to connect to the previous commit
-                    self.initialParent = ""
-            except IOError:
-                print(self.gitError.read())
-                sys.exit(1)
+                                    print("Creating temporary branch: " + tempBranch)
+                                self.commit(description, filesForCommit, tempBranch)
+                                self.tempBranches.append(tempBranch)
+                                self.checkpoint()
+                                blob = self.searchParent(parent, branch, tempBranch)
+                            if blob:
+                                self.commit(description, filesForCommit, branch, blob)
+                            else:
+                                if self.verbose:
+                                    print("Parent of %s not found. Committing into head of %s" % (branch, parent))
+                                self.commit(description, filesForCommit, branch, parent)
+                    else:
+                        files = self.extractFilesFromCommit(description)
+                        self.commit(description, files, self.branch,
+                                    self.initialParent)
+                        # only needed once, to connect to the previous commit
+                        self.initialParent = ""
+                except IOError:
+                    print(self.gitError.read())
+                    sys.exit(1)
 
     def sync_origin_only(self):
         if self.syncWithOrigin:
